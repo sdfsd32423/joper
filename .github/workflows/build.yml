@@ -1,0 +1,149 @@
+name: Build IPA
+
+# Builds Telegram-iOS at the commit in UPSTREAM_REF, applies the mod from ayu/,
+# and publishes an unsigned (fake-signed) .ipa for sideloading.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   TG_API_ID    - api_id from https://my.telegram.org/apps
+#   TG_API_HASH  - api_hash from the same page
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Telegram-iOS commit/branch (empty = UPSTREAM_REF file)"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "ayu/**"
+      - "UPSTREAM_REF"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 360
+    env:
+      SOURCE_DIR: /Users/Shared/telegram-ios
+      BAZEL_USER_ROOT: /private/var/tmp/_bazel_containerhost
+
+    steps:
+      - name: Checkout mod
+        uses: actions/checkout@v4
+
+      - name: Check secrets
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
+            echo "::error::Add TG_API_ID and TG_API_HASH in Settings -> Secrets and variables -> Actions"
+            exit 1
+          fi
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf ~/Library/Android /usr/local/share/dotnet ~/.dotnet ~/.ghcup || true
+          df -h /
+
+      - name: Fetch Telegram-iOS
+        run: |
+          REF="${{ github.event.inputs.upstream_ref }}"
+          if [ -z "$REF" ]; then REF="$(tr -d ' \r\n' < UPSTREAM_REF)"; fi
+          echo "Upstream ref: $REF"
+          sudo mkdir -p "$SOURCE_DIR"
+          sudo chown "$(whoami)" "$SOURCE_DIR"
+          cd "$SOURCE_DIR"
+          git init -q
+          git remote add origin https://github.com/TelegramMessenger/Telegram-iOS.git
+          git fetch -q --depth 1 origin "$REF"
+          git checkout -q FETCH_HEAD
+          git submodule update --init --recursive --jobs 8
+          echo "UPSTREAM_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["app"])')" >> "$GITHUB_ENV"
+          echo "XCODE_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["xcode"])')" >> "$GITHUB_ENV"
+
+      - name: Select Xcode
+        run: |
+          XCODE_APP="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "::error::Telegram-iOS needs Xcode ${XCODE_VERSION}, the runner has: $(ls -d /Applications/Xcode_* | xargs -n1 basename | tr '\n' ' ')"
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+
+      - name: Apply mod
+        run: python3 "$GITHUB_WORKSPACE/ayu/apply.py" "$SOURCE_DIR"
+
+      - name: Write build configuration
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          # bundle_id and team_id must match build-system/fake-codesigning;
+          # the sideloading tool re-signs the app with your own Apple ID anyway.
+          python3 - <<'EOF'
+          import json, os
+          path = os.path.join(os.environ["SOURCE_DIR"], "build-system/appstore-configuration.json")
+          config = json.load(open(path))
+          config["api_id"] = os.environ["TG_API_ID"].strip()
+          config["api_hash"] = os.environ["TG_API_HASH"].strip()
+          config["is_appstore_build"] = "false"
+          config["appstore_id"] = "0"
+          config["premium_iap_product_id"] = ""
+          config["enable_siri"] = False
+          config["enable_icloud"] = False
+          out = os.path.join(os.environ["RUNNER_TEMP"], "configuration.json")
+          json.dump(config, open(out, "w"), indent=2)
+          EOF
+
+      - name: Build
+        run: |
+          cd "$SOURCE_DIR"
+          BUILD_NUMBER=$((100000 + ${{ github.run_number }}))
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            build \
+            --configurationPath="$RUNNER_TEMP/configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER"
+
+      - name: Collect IPA
+        run: |
+          cd "$SOURCE_DIR"
+          mkdir -p "$RUNNER_TEMP/out"
+          IPA=$(find -L bazel-out -path '*/bin/Telegram/Telegram.ipa' -print -quit 2>/dev/null || true)
+          if [ -z "$IPA" ]; then echo "::error::Telegram.ipa not found"; exit 1; fi
+          cp "$IPA" "$RUNNER_TEMP/out/AyuGram-iOS-${APP_VERSION}-${BUILD_NUMBER}.ipa"
+          ls -lh "$RUNNER_TEMP/out"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-${{ env.BUILD_NUMBER }}
+          path: ${{ runner.temp }}/out/*.ipa
+          retention-days: 14
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ env.BUILD_NUMBER }}
+          name: ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
+          body: |
+            Telegram-iOS ${{ env.APP_VERSION }} @ ${{ env.UPSTREAM_SHA }} + mod.
+            Unsigned build: install with SideStore / AltStore / Sideloadly.
+          files: ${{ runner.temp }}/out/*.ipa
