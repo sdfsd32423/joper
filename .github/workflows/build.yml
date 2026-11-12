@@ -46,8 +46,12 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
         run: |
           if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
-            echo "::error::Add TG_API_ID and TG_API_HASH in Settings -> Secrets and variables -> Actions"
-            exit 1
+            # No keys yet: build anyway to check that everything compiles.
+            # Such an app cannot log in, so no release is published.
+            echo "::warning::TG_API_ID / TG_API_HASH are not set: TEST build with placeholder keys, login will not work"
+            echo "TEST_BUILD=true" >> "$GITHUB_ENV"
+          else
+            echo "TEST_BUILD=false" >> "$GITHUB_ENV"
           fi
 
       - name: Free disk space
@@ -97,8 +101,8 @@ jobs:
           import json, os
           path = os.path.join(os.environ["SOURCE_DIR"], "build-system/appstore-configuration.json")
           config = json.load(open(path))
-          config["api_id"] = os.environ["TG_API_ID"].strip()
-          config["api_hash"] = os.environ["TG_API_HASH"].strip()
+          config["api_id"] = os.environ["TG_API_ID"].strip() or "1"
+          config["api_hash"] = os.environ["TG_API_HASH"].strip() or "0" * 32
           config["is_appstore_build"] = "false"
           config["appstore_id"] = "0"
           config["premium_iap_product_id"] = ""
@@ -128,7 +132,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/out"
           IPA=$(find -L bazel-out -path '*/bin/Telegram/Telegram.ipa' -print -quit 2>/dev/null || true)
           if [ -z "$IPA" ]; then echo "::error::Telegram.ipa not found"; exit 1; fi
-          cp "$IPA" "$RUNNER_TEMP/out/AyuGram-iOS-${APP_VERSION}-${BUILD_NUMBER}.ipa"
+          SUFFIX=""
+          if [ "$TEST_BUILD" = "true" ]; then SUFFIX="-TEST-no-login"; fi
+          cp "$IPA" "$RUNNER_TEMP/out/AyuGram-iOS-${APP_VERSION}-${BUILD_NUMBER}${SUFFIX}.ipa"
           ls -lh "$RUNNER_TEMP/out"
 
       - name: Upload artifact
@@ -139,6 +145,7 @@ jobs:
           retention-days: 14
 
       - name: Create release
+        if: env.TEST_BUILD != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ env.BUILD_NUMBER }}
